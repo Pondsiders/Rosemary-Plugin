@@ -3,11 +3,11 @@
 These are warnings injected when context usage hits thresholds.
 Two tiers:
 
-## Amber (60%)
+## Amber (65%)
 Gentle heads-up to start thinking about pausing.
 Use {{pct}} for percentage, {{token_count}} and {{context_window}} for counts.
 
-## Red (70%)
+## Red (75%)
 Stern warning to wrap up or hand off.
 Same placeholders available.
 
