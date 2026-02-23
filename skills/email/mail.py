@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["rich"]
+# dependencies = ["rich", "html2text"]
 # ///
 
 """
 Email skill - Check inbox, read messages, send replies
 rosemary@harrell-pena-amalgamated.com via Spacemail
+
+Message numbering: 1 = newest, 2 = second newest, etc.
+This matches how the inbox displays (most recent first).
 """
 
 import sys
@@ -20,6 +23,7 @@ from email.utils import formatdate, make_msgid, parsedate_to_datetime
 from datetime import datetime
 from rich.console import Console
 from rich.table import Table
+import html2text
 
 # Spacemail configuration
 IMAP_SERVER = "mail.spacemail.com"
@@ -37,6 +41,13 @@ def get_password() -> str:
 
 console = Console()
 
+# HTML to text converter (reuse instance)
+_h2t = html2text.HTML2Text()
+_h2t.ignore_links = False
+_h2t.ignore_images = True
+_h2t.body_width = 78
+
+
 def decode_mime_header(header):
     """Decode MIME encoded header"""
     if not header:
@@ -49,19 +60,59 @@ def decode_mime_header(header):
             decoded_parts.append(part)
     return ''.join(decoded_parts)
 
+
 def get_body(msg):
-    """Extract plain text body from email"""
+    """Extract text body from email.
+
+    Tries text/plain first. Falls back to text/html converted via html2text.
+    """
+    html_body = None
+
     if msg.is_multipart():
         for part in msg.walk():
-            if part.get_content_type() == 'text/plain':
+            content_type = part.get_content_type()
+            if content_type == 'text/plain':
                 payload = part.get_payload(decode=True)
                 if payload:
                     return payload.decode('utf-8', errors='replace')
+            elif content_type == 'text/html' and html_body is None:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    html_body = payload.decode('utf-8', errors='replace')
     else:
+        content_type = msg.get_content_type()
         payload = msg.get_payload(decode=True)
         if payload:
-            return payload.decode('utf-8', errors='replace')
+            text = payload.decode('utf-8', errors='replace')
+            if content_type == 'text/plain':
+                return text
+            elif content_type == 'text/html':
+                html_body = text
+
+    # Fall back to HTML -> plaintext conversion
+    if html_body:
+        return _h2t.handle(html_body).strip()
+
     return "(no text body)"
+
+
+def _get_reversed_nums(imap) -> list[bytes]:
+    """Get all IMAP message numbers, newest first."""
+    status, messages = imap.search(None, 'ALL')
+    msg_nums = messages[0].split()
+    return list(reversed(msg_nums))
+
+
+def _resolve_msg_num(imap, logical_num: int) -> bytes:
+    """Convert logical message number (1=newest) to IMAP message number."""
+    reversed_nums = _get_reversed_nums(imap)
+    if not reversed_nums:
+        raise ValueError("Inbox is empty")
+    idx = logical_num - 1
+    if idx < 0 or idx >= len(reversed_nums):
+        raise ValueError(f"Message {logical_num} not found (inbox has {len(reversed_nums)} messages)")
+    return reversed_nums[idx]
+
 
 def cmd_inbox(limit=10):
     """Show inbox summary"""
@@ -69,25 +120,24 @@ def cmd_inbox(limit=10):
     imap.login(LOGIN_EMAIL, get_password())
     imap.select('INBOX')
 
-    status, messages = imap.search(None, 'ALL')
-    msg_nums = messages[0].split()
+    reversed_nums = _get_reversed_nums(imap)
 
-    console.print(f"\n[bold]Inbox: {len(msg_nums)} messages[/bold]\n")
+    console.print(f"\n[bold]📬 Inbox: {len(reversed_nums)} messages[/bold]\n")
 
-    if not msg_nums:
+    if not reversed_nums:
         console.print("[dim]No messages[/dim]")
         imap.logout()
         return
 
-    # Show most recent first
+    # Show most recent first, with logical numbering (1 = newest)
     table = Table(show_header=True, header_style="bold")
     table.add_column("#", style="dim", width=4)
     table.add_column("From", width=30)
     table.add_column("Subject", width=40)
     table.add_column("Date", width=20)
 
-    for num in reversed(msg_nums[-limit:]):
-        status, msg_data = imap.fetch(num, '(BODY[HEADER.FIELDS (FROM SUBJECT DATE)])')
+    for logical_num, imap_num in enumerate(reversed_nums[:limit], 1):
+        status, msg_data = imap.fetch(imap_num, '(BODY[HEADER.FIELDS (FROM SUBJECT DATE)])')
         if msg_data[0]:
             header = msg_data[0][1].decode('utf-8', errors='replace')
 
@@ -104,18 +154,19 @@ def cmd_inbox(limit=10):
                 elif line.lower().startswith('date:'):
                     date_str = line[5:].strip()[:20]
 
-            table.add_row(num.decode(), from_addr, subject, date_str)
+            table.add_row(str(logical_num), from_addr, subject, date_str)
 
     console.print(table)
     imap.logout()
 
 def cmd_read(msg_num):
-    """Read a specific message"""
+    """Read a specific message (1 = newest)"""
     imap = imaplib.IMAP4_SSL(IMAP_SERVER, 993)
     imap.login(LOGIN_EMAIL, get_password())
     imap.select('INBOX')
 
-    status, msg_data = imap.fetch(str(msg_num).encode(), '(RFC822)')
+    imap_num = _resolve_msg_num(imap, int(msg_num))
+    status, msg_data = imap.fetch(imap_num, '(RFC822)')
 
     if not msg_data[0]:
         console.print(f"[red]Message {msg_num} not found[/red]")
@@ -157,15 +208,16 @@ def cmd_send(to_addr, subject, body):
     smtp.send_message(msg)
     smtp.quit()
 
-    console.print(f"[green]Sent to {to_addr}[/green]")
+    console.print(f"[green]✓ Email sent to {to_addr}[/green]")
 
 def cmd_reply(msg_num, body):
-    """Reply to a message"""
+    """Reply to a message (1 = newest)"""
     imap = imaplib.IMAP4_SSL(IMAP_SERVER, 993)
     imap.login(LOGIN_EMAIL, get_password())
     imap.select('INBOX')
 
-    status, msg_data = imap.fetch(str(msg_num).encode(), '(RFC822)')
+    imap_num = _resolve_msg_num(imap, int(msg_num))
+    status, msg_data = imap.fetch(imap_num, '(RFC822)')
 
     if not msg_data[0]:
         console.print(f"[red]Message {msg_num} not found[/red]")
@@ -201,9 +253,9 @@ def main():
         console.print("\n[bold]Email Skill[/bold] - rosemary@harrell-pena-amalgamated.com")
         console.print("\nUsage:")
         console.print("  email inbox [limit]       Show inbox (default: 10 messages)")
-        console.print("  email read <num>          Read message by number")
+        console.print("  email read <num>          Read message (1 = newest)")
         console.print("  email send <to> <subj>    Send email (body from stdin or arg)")
-        console.print("  email reply <num>         Reply to message (body from stdin or arg)")
+        console.print("  email reply <num>         Reply to message (1 = newest)")
         console.print()
         return
 
@@ -216,7 +268,7 @@ def main():
 
         elif cmd == 'read':
             if len(sys.argv) < 3:
-                console.print("[red]Error: specify message number[/red]")
+                console.print("[red]Error: specify message number (1 = newest)[/red]")
                 return
             cmd_read(sys.argv[2])
 
@@ -232,7 +284,7 @@ def main():
 
         elif cmd == 'reply':
             if len(sys.argv) < 3:
-                console.print("[red]Error: specify message number[/red]")
+                console.print("[red]Error: specify message number (1 = newest)[/red]")
                 return
             msg_num = sys.argv[2]
             body = sys.argv[3] if len(sys.argv) > 3 else sys.stdin.read()
